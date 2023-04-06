@@ -1,0 +1,6 @@
+{
+    "uksouth": [
+        "/subscriptions/ac523bbb-5dca-46d7-9d3a-e16ddae8a7dd/resourceGroups/dpc142-connectivity-uksouth-rg/providers/Microsoft.Network/virtualNetworks/dpc142-connectivity-uksouth-vnet-1",
+        "/subscriptions/ac523bbb-5dca-46d7-9d3a-e16ddae8a7dd/resourceGroups/dpc142-connectivity-uksouth-rg/providers/Microsoft.Network/virtualNetworks/dpc142-connectivity-uksouth-vnet-2"
+    ]
+}
