@@ -1,10 +1,6 @@
 {
-    "westeurope": [
-        "/subscriptions/afffa704-8cbd-46f2-a146-b473f632ecb5/resourceGroups/ao-network/providers/Microsoft.Network/virtualNetworks/vnet-we",
-        "/subscriptions/afffa704-8cbd-46f2-a146-b473f632ecb5/resourceGroups/ao-network/providers/Microsoft.Network/virtualNetworks/vnet-we-2"
-    ],
-    "northeurope":[
-        "/subscriptions/afffa704-8cbd-46f2-a146-b473f632ecb5/resourceGroups/ao-network/providers/Microsoft.Network/virtualNetworks/vnet-ne-1",
-        "/subscriptions/afffa704-8cbd-46f2-a146-b473f632ecb5/resourceGroups/ao-network/providers/Microsoft.Network/virtualNetworks/vnet-ne-2"
+    "uksouth": [
+        "/subscriptions/ac523bbb-5dca-46d7-9d3a-e16ddae8a7dd/resourceGroups/dpc142-connectivity-uksouth-rg/providers/Microsoft.Network/virtualNetworks/dpc142-connectivity-uksouth-vnet-1",
+        "/subscriptions/ac523bbb-5dca-46d7-9d3a-e16ddae8a7dd/resourceGroups/dpc142-connectivity-uksouth-rg/providers/Microsoft.Network/virtualNetworks/dpc142-connectivity-uksouth-vnet-2"
     ]
 }
