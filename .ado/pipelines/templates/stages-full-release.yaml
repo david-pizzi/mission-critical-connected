@@ -1,0 +1,684 @@
+parameters:
+  - name: environment
+    type: string
+  - name: destroyOldEnvironment
+    type: boolean
+    default: true
+  - name: trafficSwitchSteps # in which steps (weights) the gradual traffic switch in Front Door should happen
+    type: object
+    default:
+    - 10
+    - 50
+    - 100
+
+stages:
+
+- stage: deployglobalinfrastructure
+  displayName: 'Deploy Global Infrastructure'
+  jobs:
+
+  - deployment: deployterraformglobalresources
+    displayName: 'Deploy Terraform Global Resources'
+    timeoutInMinutes: 120 # extend the default timeout of 60min since getting a certificate when using a custom domain name can take a while
+    environment: '$(environment)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self # checkout github repository
+
+          - template: steps-set-pipeline-variables.yaml # load the set-pipeline-variables function (used for tags and prefixes)
+
+          # Check if terraform state store exists, and create it if not
+          - template: steps-terraform-setup-statestore.yaml
+            parameters:
+              storageAccountName: '$(terraformStorageAccount)'
+              resourceGroupName: '$(terraformResourceGroup)'
+
+          # Global Resources terraform init
+          - template: steps-terraform-init.yaml # Initialize Terraform
+            parameters:
+              terraformStorageAccountName:       '$(terraformStorageAccount)'
+              terraformStorageResourceGroupName: '$(terraformResourceGroup)'
+              terraformStateFilename:            '$(terraformStateFileGlobal)'
+              terraformWorkingDirectory:         '$(workingDirectory)/globalresources'
+
+          - task: AzureCLI@2
+            displayName: 'Fetch current Front Door backends'
+            retryCountOnTaskFailure: 1
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+
+                $rgName = "$(prefix)$(globalResourceSuffix)-global-rg"
+                $fdName = "$(prefix)$(globalResourceSuffix)-global-fd"
+
+                # check if Front Door exists
+                $frontDoor = az afd profile list --query "[?name=='$fdName']" -o tsv
+
+                if($LastExitCode -ne 0)
+                {
+                    throw "*** Error on checking existing Front Door $fdName"
+                }
+
+                $backendPools = @("BackendApis", "StaticStorage")
+
+                if($frontDoor)
+                {
+                  foreach($pool in $backendPools)
+                  {
+
+                    echo "*** Fetching existing backends from Front Door $fdName for pool $pool"
+
+                    $backends = az afd origin list `
+                                --profile-name $fdName `
+                                --origin-group-name $pool -g $rgName | ConvertFrom-Json -NoEnumerate
+
+                    if($LastExitCode -ne 0)
+                    {
+                        throw "*** Error on fetching existing backends from Front Door $fdName for pool $pool"
+                    }
+
+                    $afdBackendsInput = @()
+
+                    foreach($backend in $backends)
+                    {
+                      $backendProperties = @{ address = $backend.hostName; `
+                                              weight = $backend.weight; `
+                                              enabled = $($backend.enabledState -eq "Enabled"); `
+                                              privatelink_location = ""; `
+                                              privatelink_service_id = "" }
+
+                      if($backend.sharedPrivateLinkResource)
+                      {
+                        # This is a privatelink backend
+                        $backendProperties.privatelink_location = $backend.sharedPrivateLinkResource.privateLinkLocation
+                        $backendProperties.privatelink_service_id = $backend.sharedPrivateLinkResource.privateLink.id
+                      }
+
+                      $backendConfig = New-Object PSObject –Property $backendProperties
+                      $afdBackendsInput += $backendConfig
+                    }
+
+                    if($afdBackendsInput.Count -gt 0)
+                    {
+                      $flatJsonApis = $afdBackendsInput | ConvertTo-Json -Compress -Depth 100 -AsArray
+                      echo "*** Current backends in pool $($pool): " $flatJsonApis
+                      $contentBackends = "-var='backends_$pool=$flatJsonApis'"
+
+                      echo "##vso[task.setvariable variable=tfParameterFrontDoor$pool]$contentBackends"
+                    }
+                    else
+                    {
+                      echo "##vso[task.setvariable variable=tfParameterFrontDoor$pool]"
+                    }
+                  }
+                }
+                else
+                {
+                  echo "*** Front Door $fdName does not exist. Using dummy backends from TF variable defaults"
+
+                  # Writing empty ADO variables for each backend pool
+                  foreach($pool in $backendPools)
+                  {
+                    echo "##vso[task.setvariable variable=tfParameterFrontDoor$pool]"
+                  }
+                }
+
+          # Global Resources deployment
+          - template: steps-terraform-apply.yaml # terraform validate, plan and apply for global resources
+            parameters:
+              jobName:                    'GlobalInfra'
+              terraformWorkingDirectory:  '$(workingDirectory)/globalresources'
+              customPrefix:               '$(prefix)'      # custom resource prefix
+              customSuffix:               '$(globalResourceSuffix)'
+              customAttributes:           '-var=branch="$(sourceBranch)"
+                                          -var=queued_by="$(Build.QueuedBy)"
+                                          -var=contact_email="$(contactEmail)"
+                                          -var=''stamps=$(stampLocations)''
+                                          -var=custom_dns_zone=$(envDomainName)
+                                          -var=custom_dns_zone_resourcegroup_name=$(envDnsZoneRG)
+                                          -var=front_door_subdomain=$(domainSuffix)
+                                          $(tfParameterFrontDoorBackendApis)
+                                          $(tfParameterFrontDoorStaticStorage)'
+
+- stage: deployreleaseinfrastructure
+  displayName: 'Deploy Release Unit Infrastructure' # Deploy Release Unit Azure Infrastructure
+  dependsOn: deployglobalinfrastructure
+  jobs:
+  - job: deployterraform
+    displayName: 'Deploy Terraform Release Unit Resources'
+    timeoutInMinutes: 120 # extend the default timeout of 60min since getting a certificate when using a custom domain name can take a while
+    steps:
+    - checkout: self # checkout github repository
+    - download: current # download pipeline artifacts
+
+    - template: steps-set-pipeline-variables.yaml # load the set-pipeline-variables function (used for tags and prefixes)
+
+    - template: steps-parse-terraform-output.yaml
+      parameters:
+        workingDirectory: '$(Pipeline.Workspace)/terraformOutputGlobalInfra'  # Global infra deploy output directory
+
+    # Release Unit Resources terraform init
+    - template: steps-terraform-init.yaml
+      parameters:
+        terraformStorageAccountName:        '$(terraformStorageAccount)'
+        terraformStorageResourceGroupName:  '$(terraformResourceGroup)'
+        terraformStateFilename:             '$(terraformStateFileReleaseUnit)'
+        terraformWorkingDirectory:          '$(workingDirectory)/releaseunit'
+
+    # Pick a VNet from the list of pre-provided VNets or create news one if needed
+    - template: steps-get-or-create-vnet.yaml
+      parameters:
+        prefix: $(prefix)
+        suffix: $(customSuffix)
+
+    # Release Unit Resources deployment
+    - template: steps-terraform-apply.yaml # terraform validate, plan and apply for global resources
+      parameters:
+        jobName:                    'ReleaseUnitInfra'
+        terraformWorkingDirectory:  '$(workingDirectory)/releaseunit'
+        customPrefix:               '$(prefix)'
+        customSuffix:               '$(customSuffix)'
+        customAttributes:           '-var=branch="$(sourceBranch)"
+                                    -var=queued_by="$(Build.QueuedBy)"
+                                    -var=contact_email="$(contactEmail)"
+                                    -var=''stamps=$(stampLocations)''
+                                    -var=''vnet_resource_ids=$(tfParameterVnetResourceIds)''
+                                    -var=aks_kubernetes_version="$(kubernetesVersion)"
+                                    -var=global_resource_group_name="$(global_resource_group_name)"
+                                    -var=monitoring_resource_group_name="$(monitoring_resource_group_name)"
+                                    -var=cosmosdb_account_name="$(cosmosdb_account_name)"
+                                    -var=cosmosdb_database_name="$(cosmosdb_database_name)"
+                                    -var=acr_name="$(acr_name)"
+                                    -var=frontdoor_resource_id="$(frontdoor_resource_id)"
+                                    -var=frontdoor_name="$(frontdoor_name)"
+                                    -var=global_storage_account_name="$(global_storage_account_name)"
+                                    -var=azure_monitor_action_group_resource_id="$(azure_monitor_action_group_resource_id)"
+                                    -var custom_dns_zone_resourcegroup_name=$(envDnsZoneRG) -var custom_dns_zone=$(envDomainName)'
+
+- stage: deployconfiguration
+  displayName: 'Deploy Configuration' # Apply configuration to Azure Infrastructure
+  dependsOn: deployreleaseinfrastructure
+  jobs:
+  - template: jobs-deploy-configuration.yaml
+
+- stage: testcode
+  displayName: 'Test Application Code'
+  dependsOn: [] # can run in parallel to the global infra deployment at the very start
+  jobs:
+  - template: jobs-code-tests.yaml
+    parameters:
+      jobName:          'CodeTests'
+      workingDirectory: 'src/app'
+
+- stage: buildapplication
+  displayName: 'Build Application Code'
+  dependsOn:
+   - testcode
+   - deployglobalinfrastructure # requires the global infra to be deployed which contains the Container Registry
+  jobs: # using jobs so they each runs in parallel
+
+  - template: jobs-container-build.yaml
+    parameters:
+      jobName:                  'catalogservice' # unique pipeline job name
+      containerImageName:       '$(catalogserviceImageName)'  # container image name for CatalogService
+      containerImageDockerFile: '$(catalogserviceDockerfile)' # dockerfile used to build the CatalogService
+
+  - template: jobs-container-build.yaml
+    parameters:
+      jobName:                  'backgroundprocessor' # unique pipeline job name
+      containerImageName:       '$(backgroundprocessorImageName)'   # container image name for BackgroundProcessor
+      containerImageDockerFile: '$(backgroundprocessorDockerfile)'  # dockerfile used to build the BackgroundProcessor
+
+  - template: jobs-container-build.yaml
+    parameters:
+      jobName:                  'healthservice' # unique pipeline job name
+      containerImageName:       '$(healthserviceImageName)'  # container image name for healthservice
+      containerImageDockerFile: '$(healthserviceDockerfile)' # dockerfile used to build the healthservice
+
+  - template: jobs-ui-app-build.yaml
+    parameters:
+      jobName:          'buildui'
+      workingDirectory: 'src/app/AlwaysOn.UI/'
+
+- stage: deployworkload # Deploy workload to previously created infrastructure
+  displayName: 'Deploy Workload'
+  dependsOn:
+  - deployconfiguration
+  - testcode
+  - buildapplication
+  jobs:
+  - template: jobs-deploy-workload.yaml
+
+# In order for the build agents to be able to test the stamps directly, they need a Private Endpoint on the internal ingress Private Link service
+- stage: createIngressPrivateEndpoints
+  displayName: 'Create Build Agent Private Endpoints for AKS Ingress'
+  dependsOn: deployworkload
+  jobs:
+  - job: createIngressPrivateEndpointsJob
+    displayName: 'Create Build Agent Private Endpoints for AKS Ingress'
+    steps:
+
+    - download: current # download pipeline artifacts
+
+    - template: steps-set-pipeline-variables.yaml # load set-pipeline-variables function
+
+    # Global Resources terraform init
+    - template: steps-terraform-init.yaml # Initialize Terraform
+      parameters:
+        terraformStorageAccountName:       '$(terraformStorageAccount)'
+        terraformStorageResourceGroupName: '$(terraformResourceGroup)'
+        terraformStateFilename:            '$(terraformStateFileReleaseUnitPrivateEndpoint)'
+        terraformWorkingDirectory:         '$(workingDirectory)/ingress_private_connections'
+
+    - task: AzureCLI@2
+      displayName: 'Fetch Private Link service configuration'
+      retryCountOnTaskFailure: 1
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          # load json data from downloaded pipeline artifact json
+          $releaseUnitInfraDeployOutput = Get-ChildItem $(Pipeline.Workspace)/terraformOutputReleaseUnitInfra/*.json | Get-Content | ConvertFrom-JSON
+
+          $stampConfigurations = @{}
+
+          # loop through stamps from pipeline artifact json
+          foreach($stamp in $releaseUnitInfraDeployOutput.stamp_properties.value) {
+
+            $location = $stamp.location
+            $nodeResourceGroup = $stamp.aks_node_resourcegroup_name
+
+            echo "*** Fetching AKS ingress Private Link Service properties for stamp in region $location"
+
+            # Sometimes the creation of the internal LB seems to take a couple of minutes. So we wait and retry
+            $retrycount = 0;
+            $maxretrycount = 10
+            do
+            {
+              # Fetch the "aks-ingress-pls" Private Link Service from the managed resource group
+              $pls = $privateLinkServices = az network private-link-service show -g $nodeResourceGroup -n $(aksPrivateLinkServiceName) | ConvertFrom-Json
+
+              if(-not $pls)
+              {
+                $retrycount++
+                echo "*** No Private Link service '$(aksPrivateLinkServiceName)' found. Waiting for 60s and retrying... $retrycount/$maxretrycount"
+                Start-Sleep 60
+              }
+              else
+              {
+                break
+              }
+            } while ( ($retrycount -lt $maxretrycount) )
+
+            if(-not $pls)
+            {
+              throw "*** No Private Link service '$(aksPrivateLinkServiceName)'"
+            }
+
+            echo "*** Fetched Private Link service $($pls.id)"
+
+            $stampProperties = @{private_link_service_id=$pls.id}
+            $stampConfig = New-Object PSObject –Property $stampProperties
+
+            $stampConfigurations[$location] = $stampConfig
+          }
+
+          $flatJsonConfigs = $stampConfigurations | ConvertTo-Json -Compress -Depth 100
+          echo "*** All private link service configs: " $flatJsonConfigs
+          $contentConfigs = "-var='private_link_service_targets=$flatJsonConfigs'"
+
+          echo "##vso[task.setvariable variable=tfParameterPrivateLinkConfigs]$contentConfigs"
+
+
+    # Global Resources deployment
+    - template: steps-terraform-apply.yaml # terraform validate, plan and apply for global resources
+      parameters:
+        jobName:                    'PrivateLinkInfra'
+        terraformWorkingDirectory:  '$(workingDirectory)/ingress_private_connections'
+        customPrefix:               '$(prefix)'      # custom resource prefix
+        customSuffix:               '$(customSuffix)'
+        customAttributes:           '-var=branch="$(sourceBranch)"
+                                    -var=queued_by="$(Build.QueuedBy)"
+                                    -var=contact_email="$(contactEmail)"
+                                    -var custom_dns_zone_resourcegroup_name=$(envDnsZoneRG)
+                                    -var custom_dns_zone=$(envDomainName)
+                                    $(tfParameterPrivateLinkConfigs)'
+
+- stage: importSampleData # Import sample data
+  displayName: 'Import sample data'
+  dependsOn: createIngressPrivateEndpoints
+  jobs:
+  - template: jobs-init-sampledata.yaml
+
+- stage: testingOnlyStampEndpoints # smoke-testing the stamp endpoints
+  displayName: 'Test Stamp Endpoints'
+  dependsOn: importSampleData
+  jobs:
+  - template: jobs-smoke-testing.yaml
+    parameters:
+      testStampEndpoints: true
+      testGlobalEndpoint: false
+
+- ${{ each step in parameters.trafficSwitchSteps }}: # based on the list parameter trafficSwitchSteps this step will be repeated n number of times
+  - template: stages-configure-frontdoor.yaml
+    parameters:
+      trafficWeightNewBackends: ${{ step }}
+
+- stage: testingGlobalEndpoints # smoke-testing global endpoint only after the switchover has happened
+  displayName: 'Test Global Endpoint'
+  jobs:
+  - template: jobs-smoke-testing.yaml
+    parameters:
+      testStampEndpoints: false
+      testGlobalEndpoint: true
+
+- ${{ if eq(parameters.destroyOldEnvironment, 'true') }}: # Only for E2E the user could have manually chosen not to destroy the environment
+  - stage: destroyOldInfrastructure                # In E2E this will destroy the infrastructure that was deployed from the same branch. For int/prod, this will fetch the previous release infra and destroy that
+    displayName: 'Destroy Infrastructure'
+    jobs:
+    - deployment: 'destroyOldReleaseStampsJob' # Using a deployment job so that we can have manual approves, which are configured on the environment specificed below
+      displayName: 'Destroy Old Release Unit Deployment'
+      timeoutInMinutes: 120 # extend the default timeout of 60min since destroy can take a while
+      environment: '$(environment)'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+
+            - checkout: self # checkout github repository
+
+            - template: steps-set-pipeline-variables.yaml # load set-pipeline-variables function
+
+            - template: steps-buildagent-prerequisites.yaml # Install tools like kubectl
+
+            - template: steps-parse-terraform-output.yaml # parse global configuration settings from terraform deployment output
+              parameters:
+                workingDirectory: '$(Pipeline.Workspace)/terraformOutputGlobalInfra'  # Global infra deploy output directory
+
+            - ${{ if ne(parameters.environment, 'e2e') }}: # Only in int/prod
+              - task: AzureCLI@2
+                displayName: 'Fetch previous release prefix through disabled Front Door origins'
+                retryCountOnTaskFailure: 1
+                inputs:
+                  azureSubscription: '$(azureServiceConnection)'
+                  scriptType: pscore
+                  scriptLocation: inlineScript
+                  inlineScript: |
+
+                    $disabledBackend = az afd origin list `
+                                --profile-name $(frontdoor_name) `
+                                --origin-group-name BackendApis -g $(global_resource_group_name) `
+                                --query "[?enabledState=='Disabled'].{hostName:hostName,privateLinkId:sharedPrivateLinkResource.privateLink.id}[0]" | ConvertFrom-Json
+
+                    if($LastExitCode -ne 0)
+                    {
+                        throw "*** Error on fetching existing disabled origns from Front Door $(frontdoor_name) for origin group 'BackendApis'. Make sure the origin group exists!"
+                    }
+
+                    $prefix = "$(prefix)"
+
+                    # Only valid if we found any disabled origin (=an old release unit)
+                    if($disabledBackend)
+                    {
+                      echo "*** Found disabled origin $($disabledBackend.hostName)"
+
+                      # Lookup the Private Link Service for this origin and fetch the Prefix tag from it
+                      $prefixSuffix = az resource show --ids $disabledBackend.privateLinkId --query "tags.Prefix" -o tsv
+
+                      if(-not $prefixSuffix)
+                      {
+                        throw "*** No Private Link Serivce found for resource id $($disabledBackend.privateLinkId)"
+                      }
+
+                      echo "*** Found prefix-suffix $prefixSuffix"
+
+                      $suffix = $prefixSuffix -creplace "$prefix","" # get suffix by removing the prefix from the prefixSuffix
+                    }
+
+                    if((-not $disabledBackend) -or (-not $suffix))
+                    {
+                      # This can happen on the very first run of the INT or PROD pipeline. We'll set the prefix to some dummy. Terraform destroy will be happy but has nothing to really destroy
+                      Write-Warning "*** No disabled origins found or prefix empty. Nothing to destroy."
+
+                      $suffix = "SUFF" # using some dummy value
+                    }
+
+                    # set pipeline variables
+                    echo "##vso[task.setvariable variable=oldReleasePrefix]$prefix"
+                    echo "##vso[task.setvariable variable=oldReleaseSuffix]$suffix"
+
+            - ${{ if eq(parameters.environment, 'e2e') }}: # Special case for E2E only
+              - task: PowerShell@2
+                displayName: '(E2E-only) Set oldRelease Prefix and Suffix to prefix-customSuffix'
+                inputs:
+                  targetType: inline
+                  script: |
+                    # Setting oldReleasePrefix=prefix-customSuffix means that we target the same release unit that was deployed earlier by this very pipeline
+                    echo "*** Setting pipeline variables oldReleasePrefix/Suffix = $(prefix) $(customSuffix)"
+
+                    echo "##vso[task.setvariable variable=oldReleasePrefix]$(prefix)"
+                    echo "##vso[task.setvariable variable=oldReleaseSuffix]$(customSuffix)"
+
+            # Remove disabled backends from Front Door and reset weight on current ones to 50. (Not required for E2E since we destroy E2E Front Door anyway below)
+            - ${{ if ne(parameters.environment, 'e2e') }}:
+              - template: steps-frontdoor-traffic-switch.yaml
+                parameters:
+                  trafficWeightNewBackends: 50
+                  removeDisabledBackends: true
+
+            # Delete all deployments in the workload namespace. This will make sure the application is not running anymore before we destroy the infrastructure in the next step.
+            # This prevents side effects in the logging in which errors might show up which are only related to the destructions of the infra
+            - task: AzureCLI@2
+              displayName: 'Delete application deployments on AKS prior to destroy'
+              retryCountOnTaskFailure: 1
+              inputs:
+                azureSubscription: $(azureServiceConnection)
+                scriptType: pscore
+                scriptLocation: inlineScript
+                inlineScript: |
+
+                  # Find AKS clusters with the prefix $(oldReleasePrefix)$(oldReleaseSuffix)
+                  $aksClusters = az aks list --query "[?tags.Prefix=='$(oldReleasePrefix)$(oldReleaseSuffix)']" | ConvertFrom-Json
+
+                  echo "*** Found $($aksClusters.Count) AKS cluster(s) for prefix-suffix $(oldReleasePrefix)$(oldReleaseSuffix)"
+
+                  # loop through all clusters
+                  foreach($cluster in $aksClusters) {
+
+                    $aksClusterName = $cluster.name
+                    $aksClusterResourceGroup = $cluster.resourceGroup
+
+                    # Load AKS credentials using --admin to bypass RBAC and interactive logins
+                    echo "*** Load credentials for AKS Cluster $aksClusterName in $aksClusterResourceGroup"
+                    az aks get-credentials --name $aksClusterName `
+                                          --resource-group $aksClusterResourceGroup `
+                                          --overwrite-existing --admin
+
+                    # First delete the ingress controllers
+                    echo "*** Deleting all deployments in namespace $(ingressNamespace)"
+                    kubectl delete --all deployments --namespace=$(ingressNamespace)
+
+                    # Now delete all the workload deployments
+                    echo "*** Deleting all deployments in namespace $(workloadNamespace)"
+                    kubectl delete --all deployments --namespace=$(workloadNamespace)
+                  }
+
+            # Before the Private Link services can be destroyed by AKS, all Private Endpoint connections need to be deleted
+            - task: AzureCLI@2
+              displayName: 'Delete AKS Ingress Private Link Endpoint Connections'
+              retryCountOnTaskFailure: 1
+              inputs:
+                azureSubscription: $(azureServiceConnection)
+                scriptType: pscore
+                scriptLocation: inlineScript
+                inlineScript: |
+
+                  $privateLinkServices = az network private-link-service list --query "[?tags.Prefix == '$(oldReleasePrefix)$(oldReleaseSuffix)']" | ConvertFrom-JSON
+
+                  echo "*** Found $($privateLinkServices.Count) Private Link service(s) for prefix-suffix $(oldReleasePrefix)$(oldReleaseSuffix)"
+
+                  foreach($plService in $privateLinkServices)
+                  {
+                    $plServiceId = $plService.id
+                    echo "*** Looking up Private Endpoint connections on Private Link $plServiceId"
+
+                    $peConnections = az network private-endpoint-connection list --id $plServiceId | ConvertFrom-Json
+
+                    foreach($peConnection in $peConnections)
+                    {
+                      echo "*** Deleting private endpoint connection: $($peConnection.name)"
+                      az network private-endpoint-connection delete --id $peConnection.id --yes
+
+                      if($LastExitCode -ne 0)
+                      {
+                          throw "*** Error on deleting private endpoint connection $($peConnection.name)"
+                      }
+                    }
+                  }
+
+            # Terraform destroy the build agent private endpoints for ingress
+            - template: steps-terraform-destroy.yaml
+              parameters:
+                terraformStorageAccountName:       '$(terraformStorageAccount)'
+                terraformStorageResourceGroupName: '$(terraformResourceGroup)'
+                terraformStateFilename:            'terraform-$(oldReleasePrefix)$(oldReleaseSuffix)-privateendpoint.state'
+                terraformWorkingDirectory:         '$(workingDirectory)/ingress_private_connections'
+                customAttributes:        '-var=prefix="$(oldReleasePrefix)"
+                                          -var=suffix="$(oldReleaseSuffix)"
+                                          -var=branch="$(sourceBranch)"
+                                          -var=queued_by="$(Build.QueuedBy)"
+                                          -var=contact_email="$(contactEmail)"
+                                          -var=custom_dns_zone_resourcegroup_name=$(envDnsZoneRG)
+                                          -var=custom_dns_zone=$(envDomainName)
+                                          -var=private_link_service_targets={}'
+
+            # Pick a VNet from the list of pre-provided VNets or create news one if needed
+            - template: steps-get-or-create-vnet.yaml
+              parameters:
+                prefix: $(oldReleasePrefix)
+                suffix: $(oldReleaseSuffix)
+
+            # Terraform destroy the stamps
+            - template: steps-terraform-destroy.yaml
+              parameters:
+                terraformStorageAccountName:       '$(terraformStorageAccount)'
+                terraformStorageResourceGroupName: '$(terraformResourceGroup)'
+                terraformStateFilename:            'terraform-$(oldReleasePrefix)$(oldReleaseSuffix).state'
+                terraformWorkingDirectory:         '$(workingDirectory)/releaseunit'
+                customAttributes:        '-var=prefix="$(oldReleasePrefix)"
+                                          -var=suffix="$(oldReleaseSuffix)"
+                                          -var=branch="$(sourceBranch)"
+                                          -var=queued_by="$(Build.QueuedBy)"
+                                          -var=contact_email="$(contactEmail)"
+                                          -var=''stamps=$(stampLocations)''
+                                          -var=''vnet_resource_ids=$(tfParameterVnetResourceIds)''
+                                          -var=aks_kubernetes_version="$(kubernetesVersion)"
+                                          -var=global_resource_group_name="$(global_resource_group_name)"
+                                          -var=monitoring_resource_group_name="$(monitoring_resource_group_name)"
+                                          -var=cosmosdb_account_name="$(cosmosdb_account_name)"
+                                          -var=cosmosdb_database_name="$(cosmosdb_database_name)"
+                                          -var=acr_name="$(acr_name)"
+                                          -var=frontdoor_resource_id="$(frontdoor_resource_id)"
+                                          -var=frontdoor_name="$(frontdoor_name)"
+                                          -var=global_storage_account_name="$(global_storage_account_name)"
+                                          -var=azure_monitor_action_group_resource_id="$(azure_monitor_action_group_resource_id)"
+                                          -var custom_dns_zone_resourcegroup_name=$(envDnsZoneRG) -var custom_dns_zone=$(envDomainName)'
+
+            # We need to clean up the VNets that were either pre-provided or temporarily created
+            # In case of pre-provided VNets: We need to remove the earmark tag so that it appears available again for future releases
+            # In case of temporarily created VNets: We delete the entire resource group which holds all the - now empty - VNets which have been created just for this release
+            - task: AzureCLI@2
+              displayName: 'Clean up VNets'
+              inputs:
+                azureSubscription: '$(azureServiceConnection)'
+                scriptType: pscore
+                scriptLocation: inlineScript
+                inlineScript: |
+
+                  $stampLocations = '$(stampLocations)' | ConvertFrom-Json -NoEnumerate
+
+                  $vnetFile = "$(System.DefaultWorkingDirectory)/.ado/pipelines/config/vnets-$(environment).json"
+
+                  if(Test-Path $vnetFile)
+                  {
+                    echo "*** Using provided VNets from file $vnetFile"
+
+                    $earmarkTagName = "AlwaysOnVnetUsedBy"
+
+                    foreach($location in $stampLocations)
+                    {
+                      echo "*** Finding VNet for region $location"
+
+                      $expectedTagValue = "$(oldReleasePrefix)$(oldReleaseSuffix)-$location"
+
+                      # Fetch the VNet which was earmaked for this release-location
+                      $vnet = az network vnet list --query "[?tags.$earmarkTagName == '$expectedTagValue']" | ConvertFrom-Json
+
+                      if($vnet)
+                      {
+                        echo "*** VNet $($vnet.name) was used by this release. Clearing tag $earmarkTagName"
+                        az tag update --operation delete --resource-id $vnet.id --tags $earmarkTagName
+                      }
+                      else
+                      {
+                        echo "*** WARNING - no VNet found with tag $earmarkTagName = $expectedTagValue"
+                      }
+                    }
+                  }
+                  else
+                  {
+                    echo "*** No pre-provided VNets for environment $(environment). Assuming temporarily created VNets which will now be deleted..."
+                    $rgName = "$(oldReleasePrefix)$(oldReleaseSuffix)-networks-rg"
+
+                    echo "*** Check if Resource Group $rgName exists"
+                    $checkRg = az group exists --name $rgName | ConvertFrom-Json
+                    if (!$checkRg) {
+                      echo "*** Resource Group $rgName does not exist (anymore). Skipping task"
+                    }
+                    else
+                    {
+                      echo "*** Deleting resource group $rgName which contains the VNet(s) for this environment"
+                      az group delete -g $rgName --yes
+                    }
+                  }
+
+    - ${{ if eq(parameters.environment, 'e2e') }}: # Only happens in E2E
+      - deployment: 'destroyE2EGlobalResourcesJob'  # Destroy globally shared resources for this E2E env
+        displayName: 'Destroy E2E Global Resources'
+        timeoutInMinutes: 120 # extend the default timeout of 60min since destroy can take a while
+        environment: '$(environment)'
+        dependsOn: 'destroyOldReleaseStampsJob'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+              - checkout: self # checkout github repository
+
+              - download: current # download pipeline artifacts
+
+              - template: steps-set-pipeline-variables.yaml # load set-pipeline-variables function
+
+              # Initialize Terraform for destroy
+              - template: steps-terraform-destroy.yaml
+                parameters:
+                  terraformStorageAccountName:        '$(terraformStorageAccount)'
+                  terraformStorageResourceGroupName:  '$(terraformResourceGroup)'
+                  terraformStateFilename:             '$(terraformStateFileGlobal)'
+                  terraformWorkingDirectory:          '$(workingDirectory)/globalresources'
+                  customAttributes:           '-var=prefix="$(prefix)"
+                                               -var=environment="${{ parameters.environment }}"
+                                               -var=suffix="$(globalResourceSuffix)"
+                                               -var=branch="$(sourceBranch)"
+                                               -var=queued_by="$(Build.QueuedBy)"
+                                               -var=contact_email="$(contactEmail)"
+                                               -var=''stamps=$(stampLocations)''
+                                               -var=custom_dns_zone=$(envDomainName)
+                                               -var=custom_dns_zone_resourcegroup_name=$(envDnsZoneRG)
+                                               -var=front_door_subdomain=$(domainSuffix)'
