@@ -15,7 +15,7 @@ parameters:
   - prod
 
 pool:
-  vmImage: 'ubuntu-20.04'
+  name: 'Default'
 
 variables:
 - name:  'environment' # set the environment name as variable
