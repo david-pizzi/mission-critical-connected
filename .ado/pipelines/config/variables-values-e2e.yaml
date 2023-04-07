@@ -4,7 +4,7 @@ variables:
 
 # Resource prefix for this environment
 - name:  'prefix'
-  value: 'dpc142'          # <===== CHANGE THIS! Must not be longer than 6 characters! Needs to be a unique prefix
+  value: 'dpc234'          # <===== CHANGE THIS! Must not be longer than 6 characters! Needs to be a unique prefix
 
 # The first value in 'stampLocations' is the primary region used for global services.
 # IMPORTANT! Changing the primary region (first value) is a BREAKING change and will destroy CosmosDB and Front Door.
@@ -25,4 +25,4 @@ variables:
 - name: 'envDnsZoneRG'
   value: 'mc-dnszones-rg'                         # <===== CHANGE THIS VALUE
 - name: 'envDomainName'
-  value: 'e2e.connected.mission-critical.app'     # <===== CHANGE THIS VALUE
+  value: 'david-pizzi.co.uk'     # <===== CHANGE THIS VALUE
