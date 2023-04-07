@@ -15,8 +15,8 @@ parameters:
   - prod
 
 pool:
-  name: 'Default'
-
+  vmImage: 'ubuntu-20.04'
+  
 variables:
 - name:  'environment' # set the environment name as variable
   value: '${{ parameters.environment }}'
