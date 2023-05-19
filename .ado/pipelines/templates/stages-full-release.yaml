@@ -377,9 +377,22 @@ stages:
     parameters:
       testStampEndpoints: false
       testGlobalEndpoint: true
-
+- stage: DeploymentValidation
+  jobs:
+  - job: waitForValidation
+    displayName: Wait for external validation  
+    pool: server    
+    steps:   
+    - task: ManualValidation@0
+      timeoutInMinutes: 1440 # task times out in 1 day
+      inputs:
+        notifyUsers: |
+          david-pizzi@hotmail.com
+        instructions: 'Please validate and resume'
+        onTimeout: 'reject'
 - ${{ if eq(parameters.destroyOldEnvironment, 'true') }}: # Only for E2E the user could have manually chosen not to destroy the environment
   - stage: destroyOldInfrastructure                # In E2E this will destroy the infrastructure that was deployed from the same branch. For int/prod, this will fetch the previous release infra and destroy that
+    condition: succeeded('DeploymentValidation')
     displayName: 'Destroy Infrastructure'
     jobs:
     - deployment: 'destroyOldReleaseStampsJob' # Using a deployment job so that we can have manual approves, which are configured on the environment specificed below
