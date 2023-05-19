@@ -329,7 +329,8 @@ stages:
                                              -var=front_door_subdomain=$(domainSuffix)'
                                                
 - stage: deployglobalinfrastructure
-  displayName: 'Deploy Global Infrastructure'
+  displayName: 'Deploy Global Infrastructure'  
+  dependsOn: [] # can run in parallel to the global infra deployment at the very start
   jobs:
 
   - deployment: deployterraformglobalresources
